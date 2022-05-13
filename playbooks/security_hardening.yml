@@ -1,0 +1,354 @@
+#=============================================
+#SECURITY HARDENING PLAYBOOK - DM SERIES (ONTAP systems)
+#-----
+#DESCRIPTION:
+# - Helps user apply security settings to SVM(s) to be in compliance
+#   with suggested security settings
+#USE:
+# - ansible-playbook security_hardening.yml (Follow prompts for user input when prompted)
+#NOTE:
+# - It is suggested to execute this playbook with the ANSIBLE_STDOUT_CALLBACK=yaml directive
+#   when executing the playbook for better output formatting 
+#   (ie. ANSIBLE_STDOUT_CALLBACK=yaml ansible-playbook security_hardening.yml)
+#---------------------------------------------
+# Copyright © 2022 Lenovo. All rights reserved. 
+# License: Subject to terms of COE-30002-02 Lenovo License Agreement 05.2022 (see License.md located in the root directory) 
+# Author: Lenovo 
+#=============================================
+---
+  -  hosts: localhost
+     vars_prompt:
+      - name: "cluster_ip"
+        prompt: "Enter Cluster management IP address"
+        private: no
+      - name: "username"
+        prompt: "Enter Cluster admin username"
+        private: no
+      - name: "password"
+        prompt: "Enter Cluster admin password"
+        private: yes
+      - name: "vserver"
+        prompt: "Enter name of vserver to use"
+        private: no
+      - name: "modify"
+        prompt: "Modify login security settings? (y|n)"
+        private: no
+        default: 'n'
+      - name: "acknowledge"
+        prompt: "Note: Please SSH into cluster after executing this playbook to change the password for the user. Acknowledged? (y|n)"
+        private: no
+        default: 'n'
+     vars:
+        login: &login
+          hostname: "{{ cluster_ip }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+          https: "y"
+          validate_certs: "n"
+        ansible_python_interpreter: /usr/bin/python3
+     #vars_files:
+      #- lenovo_vars.yml
+     collections:
+      - netapp.ontap
+     tasks:
+      ########################
+      #Perform pre-req checks#
+      ########################
+      - name: Check acknowledgement
+        when: acknowledge == 'n'
+        block:
+         - name: Print termination
+           debug:
+            msg: "[NOTICE]: Terminating due to acknowledgment not recognized"
+         - meta: end_play
+      - name: Check ONTAP version
+        when: modify == 'y'
+        block:
+         - name: Set valid ONTAP versions
+           set_fact:
+            supported_ontap_versions: [9.9.1,9.10.1]
+         - name: Get ONTAP version
+           na_ontap_command:
+            command: ['cluster','image','show','-fields','version']
+            exclude_lines: 'ersion' #exclude lines with Version or version
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+           register: ontap_version
+         - name: Validate supported ONTAP version
+           when: ontap_version.msg.stdout_lines_filter is not search(supported_ontap_versions[0]) and
+                 ontap_version.msg.stdout_lines_filter is not search(supported_ontap_versions[1])
+           block:
+            - name: Print not supported ONTAP version
+              debug:
+               msg: "[ERROR]: Non-supported ONTAP version for specified cluster. Terminating..."
+            - meta: end_play
+         - name: Check for ONTAP 9.11.1 or above
+           when: ontap_version.msg.stdout_lines_filter is search(supported_ontap_versions[0]) or
+                 ontap_version.msg.stdout_lines_filter is search(supported_ontap_versions[1])
+           set_fact:
+            ontap_9111_above: 'n'
+      #######################
+      #Set security settings#
+      #######################
+      - name: Set security settings
+        when: vserver is defined and modify == "y"
+        block:
+         #Get remaining input
+         - name: Get login banner message
+           pause:
+            prompt: "Please enter desired message for login banner"
+           register: login_banner
+         #Set security parameters
+         #- name: Setting lockout period to 1 day for {{ vserver }} SVM
+         #  na_ontap_command:
+         #   command: ['security', 'login', 'role', 'config', 'modify', '-vserver', '{{ vserver }}', '-lockout-duration', '1', '-role', '*']
+         #   privilege: 'admin'
+         #   return_dict: true
+         #   <<: *login
+         #- name: Setting maximum failed login attempts to 10 for {{ vserver }} SVM
+         #  na_ontap_command:
+         #   command: ['security', 'login', 'role', 'config', 'modify', '-vserver', '{{ vserver }}', '-max-failed-login-attempts', '10', '-role', '*']
+         #   privilege: 'admin'
+         #   return_dict: true
+         #   <<: *login
+         - name: Setting minimum number of digits for password to be 1 for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'modify', '-vserver', '{{ vserver }}', '-passwd-min-digits', '1', '-role', '*']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+         - name: Setting minimum number of special characters for password to be 1 for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'modify', '-vserver', '{{ vserver }}', '-passwd-min-special-chars', '1', '-role', '*']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+         - name: Setting minimum number of lowercase letters for password to be 1 for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'modify', '-vserver', '{{ vserver }}', '-passwd-min-lowercase-chars', '1', '-role', '*']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+         - name: Setting minimum number of uppercase letters for password to be 1 for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'modify', '-vserver', '{{ vserver }}', '-passwd-min-uppercase-chars', '1', '-role', '*']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+         - name: Setting number of unique passwords before re-use to 5 for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'modify', '-vserver', '{{ vserver }}', '-disallowed-reuse', '5', '-role', '*']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+         - name: Setting number of days for password change delay to 1 for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'modify', '-vserver', '{{ vserver }}', '-change-delay', '1', '-role', '*']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+         #- name: Enabling password change upon initial account login for {{ vserver }} SVM
+         # > Executed below after print out due to password change requirement
+         - name: Setting login banner for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'banner', 'modify', '-vserver', '{{ vserver }}', '-message', '{{ login_banner.user_input|trim }}']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+         - name: Setting TLS and cipher settings for {{ vserver }} SVM
+           block:
+            - name: Setting TLS and cipher settings for ONTAP 9.9.1 or 9.10.1
+              when: ontap_9111_above == 'n'
+              na_ontap_command:
+               command: ['security', 'config', 'modify', '-interface', 'SSL', '-supported-protocols', 'TLSv1.2', 'supported-ciphers', 'PSK:DHE:ECDHE:!LOW:!aNULL:!EXP:!eNULL:!3DES:!kDH:!kECDH']
+               privilege: 'advanced'
+               return_dict: true
+               <<: *login
+            #- name: Setting TLS and cipher settings for ONTAP 9.11.1+
+            #  when: ontap_9111_above == 'y'
+            #   na_ontap_command:
+            #    command: ['security', 'config', 'modify', '-interface', 'SSL', '-supported-protocols', 'TLSv1.2', 'supported-ciphers', 'PSK:DHE:ECDHE:!LOW:!aNULL:!EXP:!eNULL:!3DES:!kDH:!kECDH']
+            #    privilege: 'advanced'
+            #    return_dict: true
+            #    <<: *login
+      #######################
+      #Get security settings#
+      #######################
+      - name: Get security settings
+        when: vserver is defined
+        block:
+          #Read back set security parameters
+         #- name: Get lockout duration {{ vserver }} SVM
+         #  na_ontap_command:
+         #   command: ['security', 'login', 'role', 'config', 'show', '-vserver', '{{ vserver }}', '-fields', 'lockout-duration']
+         #   privilege: 'admin'
+         #   return_dict: true
+         #   <<: *login
+         #  register: lockout_duration
+         #- name: Get max failed login attempts for {{ vserver }} SVM
+         #  na_ontap_command:
+         #   command: ['security', 'login', 'role', 'config', 'show', '-vserver', '{{ vserver }}', '-fields', 'max-failed-login-attempts']
+         #   privilege: 'admin'
+         #   return_dict: true
+         #   <<: *login
+         #  register: max_failed_login_attempts
+         - name: Get minimum number of digits for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'show', '-vserver', '{{ vserver }}', '-fields', 'passwd-min-digits']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+           register: password_min_digits
+         - name: Get minimum number of special characters for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'show', '-vserver', '{{ vserver }}', '-fields', 'passwd-min-special-chars']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+           register: password_min_special_chars
+         - name: Get minimum number of lowercase letters for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'show', '-vserver', '{{ vserver }}', '-fields', 'passwd-min-lowercase-chars']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+           register: password_min_lowercase_chars
+         - name: Get minimum number of uppercase letters for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'show', '-vserver', '{{ vserver }}', '-fields', 'passwd-min-uppercase-chars']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+           register: password_min_uppercase_chars
+         - name: Get number of unique passwords before re-use for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'show', '-vserver', '{{ vserver }}', '-fields', 'disallowed-reuse']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+           register: password_cycle
+         - name: Get number of days for password change delay for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'show', '-vserver', '{{ vserver }}', '-fields', 'change-delay']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+           register: password_change_delay
+         #- name: Get password change upon initial account login requirement for {{ vserver }} SVM
+           #when: modify == "n"
+           #na_ontap_command:
+            #command: ['security', 'login', 'role', 'config', 'show', '-vserver', '{{ vserver }}', '-fields', 'require-initial-passwd-update']
+            #privilege: 'admin'
+            #return_dict: true
+            #<<: *login
+           #register: password_first_login_change
+         - name: Get login banner for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'banner', 'show', '-vserver', '{{ vserver }}']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login
+           register: login_banner
+         - name: Get TLS and cipher settings for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'config', 'show']
+            privilege: 'advanced'
+            return_dict: true
+            <<: *login
+           register: tls_cipher_settings
+         - name: Print results for {{ vserver }} SVM
+           debug:
+            msg: 
+              - "##########################SECURITY SETTINGS##########################"
+              #- "Lockout Duration: {{ lockout_duration.msg.stdout }}"
+              #- "Maximum Failed Login Attempts: {{ max_failed_login_attempts.msg.stdout }}"
+              - "Minimum Digits for Password: {{ password_min_digits.msg.stdout }}"
+              - "Minimum Special Characters for Password: {{ password_min_special_chars.msg.stdout }}"
+              - "Minimum Lower Case Characters for Password: {{ password_min_lowercase_chars.msg.stdout }}"
+              - "Minimum Upper Case Characters for Password: {{ password_min_uppercase_chars.msg.stdout }}"
+              - "Number of passwords before allowed reuse: {{ password_cycle.msg.stdout }}"
+              - "Password change delay duration: {{ password_change_delay.msg.stdout }}"
+              #- "Password change upon initial account login: {{ password_first_login_change.msg.stdout }}"
+              - "Login banner: {{ login_banner.msg.stdout }}"
+              - "TLS and Cipher setttings: {{ tls_cipher_settings.msg.stdout }}"
+              - "#####################################################################"
+         - name: Check aggr encryption
+           block:
+            - name: Get aggregate encryption status
+              na_ontap_command:
+               command: ['storage', 'aggregate', 'show', '-fields', 'encrypt-with-aggr-key']
+               #exclude_lines: 'ersion' #exclude lines with Version or version
+               privilege: 'admin'
+               return_dict: true
+               <<: *login
+              register: aggr_encryption
+            - name: Check for non-encrypted aggr
+              when: aggr_encryption.msg.stdout_lines is search("false")
+              debug:
+               msg: "[INFO]: Non-encrypted aggregate(s) present. Recommended to encrypt. To see aggregate encryption status, run: storage aggregate show -fields encrypt-with-aggr-key"
+         - name: Check volume encryption
+           block:
+            - name: Get volume encryption status
+              na_ontap_command:
+               command: ['volume', 'show', '-fields', 'encrypt']
+               #exclude_lines: 'ersion' #exclude lines with Version or version
+               privilege: 'admin'
+               return_dict: true
+               <<: *login
+              register: vol_encryption
+            - name: Check for non-encrypted volume
+              when: vol_encryption.msg.stdout_lines is search("false")
+              debug:
+               msg: "[INFO]: Non-encrypted volume(s) present. Recommended to encrypt. To see volume encryption status, run: volume show -fields encrypt"
+         - name: Check vserver audit status
+           block: 
+            - name: Get vserver audit status
+              na_ontap_command:
+               command: ['vserver', 'audit', 'show', '-fields', 'state']
+               exclude_lines: 'vserver' #exclude lines with vserver
+               privilege: 'admin'
+               return_dict: true
+               <<: *login
+              register: vserver_audit_status
+            - name: Check for audit enablement
+              when: vserver_audit_status.msg.stdout_lines is search("false") or vserver_audit_status.msg.stdout_lines is search("matching")
+              debug:
+               msg: "[INFO]: SVMs without auditing enabled present. Recommended to configure auditing on SVMs. To configure auditing on SVMs, run: vserver audit create -vserver <vserver>"
+         - name: Prompt user for signed certificate install
+           debug:
+            msg: "[INFO]: It is recommended to use signed certificates in the cluster. Please refer to the Certificate playbook for installation."
+         - name: Check NTP servers
+           block:
+            - name: Get NTP servers
+              na_ontap_command:
+               command: ['cluster', 'time-service', 'ntp', 'server', 'show']
+               exclude_lines: 'Server' #exclude lines with Server
+               privilege: 'admin'
+               return_dict: true
+               <<: *login
+              register: ntp_servers
+            - name: Check for NTP servers
+              when: ntp_servers.msg.stdout_lines_filter is search("empty")
+              block: 
+               - name: Print empty NTP message
+                 debug:
+                  msg: "[INFO]: No NTP servers configured. Recommended to setup at least 3 NTP servers (minimum 1). To configure NTP, run: cluster time-service ntp server create"
+               - name: Set variable
+                 set_fact: ntp_empty=1
+            - name: Check for recommended number of NTP servers
+              when: ntp_servers.msg.stdout_lines_filter|length > 0 and ntp_servers.msg.stdout_lines_filter|length < 3 and ntp_empty == 0
+              debug:
+               msg: "[INFO]: Less than 3 NTP servers configured. Recommended to setup at least 3 NTP servers. To configure NTP, run: cluster time-service ntp server create"
+      #############################################################
+      #Enable password change requirement on initial account login#
+      #############################################################
+      - name: Enable initial password change feature
+        when: vserver is defined and modify == "y"
+        block:
+         - name: Enabling password change upon initial account login for {{ vserver }} SVM
+           na_ontap_command:
+            command: ['security', 'login', 'role', 'config', 'modify', '-vserver', '{{ vserver }}', '-require-initial-passwd-update', 'enabled', '-role', '*']
+            privilege: 'admin'
+            return_dict: true
+            <<: *login

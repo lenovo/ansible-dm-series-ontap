@@ -1,0 +1,55 @@
+#=============================================
+#SNAPSHOT PLAYBOOK - DM SERIES (ONTAP systems)
+#-----
+#DESCRIPTION:
+# - Helps user to create a snapshot for a specified volume
+#USE:
+# - ansible-playbook snapshot.yml (Follow prompts for user input when prompted)
+#---------------------------------------------
+# Copyright © 2022 Lenovo. All rights reserved. 
+# License: Subject to terms of COE-30002-02 Lenovo License Agreement 05.2022 (see License.md located in the root directory) 
+# Author: Lenovo 
+#=============================================
+---
+  -  hosts: localhost
+     vars_prompt:
+      - name: "cluster_ip"
+        prompt: "Enter Cluster management IP address"
+        private: no
+      - name: "username"
+        prompt: "Enter Cluster admin username"
+        private: no
+      - name: "password"
+        prompt: "Enter Cluster admin password"
+        private: yes
+      - name: "vserver"
+        prompt: "Please enter name for Storage VM (SVM) to create"
+        private: no
+      - name: "snapshot"
+        prompt: "Please enter name of snapshot"
+        private: no
+      - name: "volume"
+        prompt: "Please enter volumne name to take snapshot"
+        private: no
+     vars:
+        login: &login
+          hostname: "{{ cluster_ip }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+          https: true
+          validate_certs: false
+        ansible_python_interpreter: /usr/bin/python3
+     #vars_files:
+      #- vars.yml
+     collections:
+      - netapp.ontap
+     tasks:
+      #Take snapshot
+      - name: take snapshot
+        na_ontap_snapshot:
+          state: present
+          vserver: "{{ vserver }}"
+          snapshot: "{{ snapshot }}"
+          volume: "{{ volume }}"
+          comment: "{{ snapshot }} on {{ vserver }}/{{ volume }}"
+          <<: *login

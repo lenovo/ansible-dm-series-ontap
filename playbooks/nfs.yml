@@ -1,0 +1,327 @@
+#=============================================
+#NFS SETUP PLAYBOOK - DM SERIES (ONTAP systems)
+#-----
+#DESCRIPTION:
+# - Helps user to create an SVM for NFS and provision a volume
+#   for specified initiators to use with mount point
+#   and export policies
+#USE:
+# - ansible-playbook nfs.yml (Follow prompts for user input when prompted)
+#---------------------------------------------
+# Copyright © 2022 Lenovo. All rights reserved. 
+# License: Subject to terms of COE-30002-02 Lenovo License Agreement 05.2022 (see License.md located in the root directory) 
+# Author: Lenovo 
+#=============================================
+---
+  -  hosts: localhost
+     vars_prompt:
+      - name: "cluster_ip"
+        prompt: "Enter Cluster management IP address"
+        private: no
+      - name: "username"
+        prompt: "Enter Cluster admin username"
+        private: no
+      - name: "password"
+        prompt: "Enter Cluster admin password"
+        private: yes
+      - name: "vserver"
+        prompt: "Please enter name for Storage VM (SVM) to create"
+        private: no
+      #- name: "aggregate"
+      #  prompt: "Please enter name of the data aggregate(local tier) to create"
+      #  private: no
+      - name: "volume_name"
+        prompt: "Please enter a name for volume to create"
+        private: no
+      - name: "volume_size"
+        prompt: "Please enter the size for the volume"
+        private: no
+      - name: "volume_size_units"
+        prompt: "Please enter the unit for the volume size (kb|mb|gb|tb|pb)"
+        private: no
+      #- name: "storage_service"
+      #  prompt: "Please enter the storage service policy to use for the volume (value|performance|extreme)"
+      #  private: no
+      #  default: "value"
+      - name: "percent_snapshot_space"
+        prompt: "Please enter the percent snapshot space to use for the volume (0 for none)"
+        private: no
+      #NFS specific fields
+      - name: "infinite_volume"
+        prompt: "Infinite volume? (y|n)"
+        private: no
+      - name: "export_policy"
+        prompt: "Please enter name of export policy to create"
+        private: no
+      - name: "client_match"
+        prompt: "Please enter IPs accepted for client matches (ie. 0.0.0.0/0,1.1.1.0/24)"
+        private: no
+      - name: "ro_rule"
+        prompt: "Please enter ro rule (default = any; any|none|never|krb5|krb5i|krb5p|ntlm|sys)"
+        default: "any"
+        private: no
+      - name: "rw_rule"
+        prompt: "Please enter rw rule (default = any; any|none|never|krb5|krb5i|krb5p|ntlm|sys)"
+        default: "any"
+        private: no
+      - name: "protocol"
+        prompt: "Please enter NFS protocol to use (default = any; any|nfs|nfs3|nfs4)"
+        default: "any"
+        private: no
+      - name: "super_user_security"
+        prompt: "Please enter Superuser access privileges (default = any; any|none|krb5|krb5i|krb5p|ntlm|sys)"
+        default: "any"
+        private: no
+      - name: "anonymous_user_id"
+        prompt: "Please enter ID for Anonymous user (default = 65534)"
+        default: "65534"
+        private: no
+      - name: "home_port"
+        prompt: "Please enter home port for network interfaces to be hosted on (ie. e0c)"
+        private: no
+      - name: "ip1"
+        prompt: "Please enter IP address to use for data LIF 1"
+        private: no
+      - name: "netmask1"
+        prompt: "Please enter subnetmask to use for data LIF 1"
+        private: no
+      - name: "ip2"
+        prompt: "Please enter IP address to use for data LIF 2"
+        private: no
+      - name: "netmask2"
+        prompt: "Please enter subnetmask to use for data LIF 2"
+        private: no
+      - name: "confirmation"
+        prompt: "~Please note this playbook will create a SVM, data aggregates, volume, namespace, etc. Continue?(y|n)"
+        private: no
+     vars:
+        login: &login
+          hostname: "{{ cluster_ip }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+          https: true
+          validate_certs: false
+        ansible_python_interpreter: /usr/bin/python3
+     #vars_files:
+      #- vars.yml
+     collections:
+      - netapp.ontap
+     tasks:
+      ###########################
+      ###Check acknowledgement###
+      ###########################
+      - name: Check termination
+        when: confirmation|trim == "n" or confirmation|trim == "no"
+        debug:
+         msg: "Terminating playbook due to user input..."
+      - meta: end_play
+        when: confirmation|trim == "n" or confirmation|trim == "no"
+      ######################
+      ###Field Validation###
+      ######################
+      #volume unit size
+      - name: Check valid unit size selected for volume
+        block:
+         - name: Set valid unit sizes
+           set_fact: 
+            unit_size_list: [kb, mb, gb, tb, pb]
+         - name: Print invalid unit size
+           when: volume_size_units|trim not in unit_size_list|to_json
+           debug:
+            msg: "[ERROR]: Invalid unit size specified ({{ volume_size_units|trim }})"
+         - meta: end_play
+           when: volume_size_units|trim not in unit_size_list|to_json
+      #percent snapshot space
+      - name: Check valid snapshot space amount selected
+        when: percent_snapshot_space|trim|int < 0 or percent_snapshot_space|trim|int > 100
+        block:
+         - name: Print invalid snapshot space
+           debug:
+            msg: "[ERROR]: Invalid snapshot space specified ({{ percent_snapshot_space|trim }})"
+         - meta: end_play
+      #ro_rule
+      - name: check valid ro rule selected
+        block:
+         - name: set valid ro rule options
+           set_fact:
+            ro_rule_list: [any, none, never, krb5, krb5i, krb5p, ntlm, sys]
+         - name: check ro rule
+           when: ro_rule|trim not in ro_rule_list|to_json
+           debug:
+            msg: "[ERROR]: invalid ro rule option specified ({{ ro_rule|trim }})"
+         - meta: end_play
+           when: ro_rule|trim not in ro_rule_list|to_json
+      #rw_rule
+      - name: check valid rw rule selected
+        block:
+         - name: set valid rw rule options
+           set_fact:
+            rw_rule_list: [any, none, never, krb5, krb5i, krb5p, ntlm, sys]
+         - name: check rw rule
+           when: rw_rule|trim not in rw_rule_list|to_json
+           debug:
+            msg: "[ERROR]: invalid rw rule option specified ({{ rw_rule|trim }})"
+         - meta: end_play
+           when: rw_rule|trim not in rw_rule_list|to_json
+      #protocol
+      - name: check valid protocol selected
+        block:
+         - name: set valid protocol options
+           set_fact:
+            protocol_list: [any, nfs, nfs3, nfs4]
+         - name: check protocol
+           when: protocol|trim not in protocol_list|to_json
+           debug:
+            msg: "[ERROR]: invalid protocol specified ({{ protocol|trim }})"
+         - meta: end_play
+           when: protocol|trim not in protocol_list|to_json
+      #super user security
+      - name: check super user security option selected
+        block:
+         - name: set valid super user security options
+           set_fact:
+            super_user_sec_list: [any, none, krb5, krb5i, krb5p, ntlm, sys]
+         - name: check super user security option
+           when: super_user_security|trim not in super_user_sec_list|to_json
+           debug:
+            msg: "[ERROR]: invalid super user security option specified ({{ super_user_security|trim }})"
+         - meta: end_play
+           when: super_user_security|trim not in super_user_sec_list|to_json
+      ##################
+      ###Variable Set###
+      ##################
+      - name: Set infinite volume 
+        when: infinite_volume == "y"
+        set_fact:
+         infinite_volume: True
+      - name: Set infinite volume
+        when: infinite_volume == "n"
+        set_fact:
+         infinite_volume: False
+      ########################
+      ###Creation Procedure###
+      ########################
+      - name: Gather disk facts
+        na_ontap_command:
+         command: ['disk', 'show', '-fields', 'disk']
+         return_dict: true 
+         <<: *login
+        register: disk_dict
+      - set_fact:
+         half_disk_count: "{{ (((disk_dict.msg.stdout_lines|length)-3)/2)|int }}"
+      - name: Gather node facts
+        na_ontap_command:
+         command: ['node', 'show', '-fields', 'node']
+         exclude_lines: "u'"
+         return_dict: true 
+         <<: *login
+        register: node_dict
+      - set_fact:
+         node1: "{{ node_dict.msg.stdout_lines_filter[2] }}"
+         node2: "{{ node_dict.msg.stdout_lines_filter[3] }}"
+      #Data aggregate creation
+      - name: Create data aggregate 1 for {{ vserver }}
+        na_ontap_aggregate:
+         state: present
+         service_state: online
+         name: "{{ vserver }}_aggr_1"
+         disk_count: "{{ half_disk_count }}"
+         nodes: "{{ node1 }}"
+         wait_for_online: True
+         time_out: 300
+         <<: *login
+      - name: Create data aggregate 2 for {{ vserver }}
+        na_ontap_aggregate:
+         state: present
+         service_state: online
+         name: "{{ vserver }}_aggr_2"
+         disk_count: "{{ half_disk_count }}"
+         nodes: "{{ node2 }}"
+         wait_for_online: True
+         time_out: 300
+         <<: *login
+      #Vserver creation
+      - name: Create SVM {{ vserver }} with NFS enabled
+        na_ontap_svm:
+         state: present
+         name: "{{ vserver }}"
+         allowed_protocols: nfs
+         <<: *login
+      #Network interface creation
+      - name: Create network interface 1 for {{ vserver }}
+        na_ontap_interface:
+         state: present
+         interface_name: "{{ vserver }}_data_1"
+         home_port: "{{ home_port }}"
+         home_node: "{{ node1 }}"
+         role: data #<undef|cluster|data|node-mgmt|intercluster|cluster-mgmt>
+         protocols: nfs
+         admin_status: up
+         address: "{{ ip1 }}"
+         netmask: "{{ netmask1 }}"
+         vserver: "{{ vserver }}"
+         <<: *login
+      - name: Create network interface 2 for {{ vserver }}
+        na_ontap_interface:
+         state: present
+         interface_name: "{{ vserver }}_data_2"
+         home_port: "{{ home_port }}"
+         home_node: "{{ node2 }}"
+         role: data #<undef|cluster|data|node-mgmt|intercluster|cluster-mgmt>
+         protocols: nfs
+         admin_status: up
+         address: "{{ ip2 }}"
+         netmask: "{{ netmask2 }}"
+         vserver: "{{ vserver }}"
+         <<: *login
+      #Export Policy creation
+      - name: Create Export Policy
+        na_ontap_export_policy:
+         state: present
+         name: "{{ export_policy }}"
+         vserver: "{{ vserver }}"
+         <<: *login 
+      - name: Create Export Policy Rule
+        na_ontap_export_policy_rule:
+         state: present
+         name: "{{ export_policy }}"
+         vserver: "{{ vserver }}"
+         client_match: "{{ client_match }}"
+         ro_rule: "{{ ro_rule }}"
+         rw_rule: "{{ rw_rule }}"
+         protocol: "{{ protocol }}"
+         super_user_security: "{{ super_user_security }}"
+         anonymous_user_id: "{{ anonymous_user_id }}"
+         allow_suid: true
+         <<: *login
+      #Junction Path creation
+      - name: Set Junction Path
+        set_fact: 
+         junction_path: "/{{ volume_name }}" #Use junc path '' to unmount
+      #Volume creation
+      - name: Create FlexVol for {{ vserver }}
+        na_ontap_volume:
+         state: present
+         name: "{{ volume_name }}"
+         size: "{{ volume_size }}"
+         size_unit: "{{ volume_size_units }}"
+         vserver: "{{ vserver }}"
+         aggregate_name: "{{ vserver }}_aggr_1"
+         #storage_service: "{{ storage_service }}"
+         percent_snapshot_space: "{{ percent_snapshot_space }}"
+         is_infinite: "{{ infinite_volume }}"
+         export_policy: "{{ export_policy }}"
+         junction_path: "{{ junction_path }}"
+         <<: *login
+      ###Print results###
+      - name: Print results
+        debug:
+         msg:
+          - "###RESULTS###"
+          - "Created the following:"
+          - " - SVM: {{ vserver }}"
+          - " - Data aggregates(tiers): {{ vserver }}_aggr_1, {{ vserver }}_aggr_2"
+          - " - Data LIFs: {{ vserver }}_data_1 ({{ ip1 }}), {{ vserver }}_data_2 ({{ ip2 }})"
+          - " - Volume: {{ volume_name }}"
+          - " - Export Policy: {{ export_policy }}"
+          - " - Junction Path: {{ junction_path }}"

@@ -1,0 +1,105 @@
+#=============================================
+#CERTIFICATE SETUP PLAYBOOK - DM SERIES (ONTAP systems)
+#-----
+#DESCRIPTION:
+# - Helps user to install a signed certificate or self-signed certificate to SVM(s)
+#USE:
+# - ansible-playbook certificate.yml (Follow prompts for user input when prompted)
+#NOTE:
+# - Installtion of community.crypto collection is required for this playbook
+#---------------------------------------------
+# Copyright © 2022 Lenovo. All rights reserved. 
+# License: Subject to terms of COE-30002-02 Lenovo License Agreement 05.2022 (see License.md located in the root directory) 
+# Author: Lenovo 
+#=============================================
+---
+  -  hosts: localhost
+     vars_prompt:
+      - name: "cluster_ip"
+        prompt: "Enter Cluster management IP address"
+        private: no
+      - name: "username"
+        prompt: "Enter Cluster admin username"
+        private: no
+      - name: "password"
+        prompt: "Enter Cluster admin password"
+        private: yes
+      - name: "vserver"
+        prompt: "Please enter name for Storage VM (SVM) to create"
+        private: no
+      - name: "selfsigned"
+        prompt: "Is self-signed certificate (yes|no)"
+        private: no
+      - name: "privatekey_file"
+        prompt: "Where is the private key file path"
+        private: no
+      - name: "certificate_file"
+        prompt: "Where is the certificate file path"
+        private: no
+      - name: "common_name"
+        prompt: "Common Name"
+        private: no
+     vars:
+        login: &login
+          hostname: "{{ cluster_ip }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+          https: true
+          validate_certs: false
+        ansible_python_interpreter: /usr/bin/python3
+     #vars_files:
+      #- vars.yml
+     collections:
+      - community.crypto
+      - netapp.ontap
+     tasks:
+      #Create private key
+      - name: Generate an OpenSSL private key with the default values (4096 bits, RSA)
+        when: (selfsigned|lower) == "yes"
+        openssl_privatekey:
+          path: "{{ privatekey_file }}"
+      #Create CSR
+      - name: Generate an OpenSSL Certificate Signing Request
+        when: (selfsigned|lower) == "yes"
+        openssl_csr:
+          path: "{{ common_name }}.csr"
+          privatekey_path: "{{ privatekey_file }}"
+          common_name: "{{ common_name }}"
+      #Create certificate
+      - name: Generate a Self Signed OpenSSL certificate
+        when: (selfsigned|lower) == "yes"
+        openssl_certificate:
+          path: "{{ certificate_file }}"
+          privatekey_path: "{{ privatekey_file }}"
+          csr_path: "{{ common_name }}.csr"
+          provider: selfsigned
+      #Read private key PEM
+      - name: "Read privatekey PEM data"
+        slurp:
+          src: "{{ privatekey_file }}"
+        register: privatekey
+      - name: "Print the private key PEM content to a console"
+        debug:
+          msg: "{{ privatekey.content | b64decode}}"
+      - set_fact:
+          privatekey: "{{ privatekey.content | b64decode }}"
+      #Read certificate PEM
+      - name: "Read certificate PEM data"
+        slurp:
+          src: "{{ certificate_file }}"
+        register: certificate
+      - name: "Print the certificate PEM content to a console"
+        debug:
+          msg: "{{ certificate.content | b64decode}}"
+      - set_fact:
+          certificate: "{{ certificate.content | b64decode }}"
+      #Install certificate
+      - name: install certificate
+        na_ontap_security_certificates:
+          common_name: "{{ common_name }}"
+          private_key: "{{ privatekey }}"
+          public_certificate: "{{ certificate }}"
+          type: server
+          svm: "{{ vserver }}"
+          use_rest: always
+          <<: *login

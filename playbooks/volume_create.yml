@@ -1,0 +1,974 @@
+#=============================================
+#VOLUME PROVISIONING PLAYBOOK - DM SERIES (ONTAP systems)
+#-----
+#DESCRIPTION:
+# - Helps user create a LUN (SAN), volume (NAS) or namespace (NVMe)
+#   for a pre-existing SVM and aggregate
+#USE:
+# - ansible-playbook volume_create.yml (Follow prompts for user input when prompted)
+#---------------------------------------------
+# Copyright © 2022 Lenovo. All rights reserved. 
+# License: Subject to terms of COE-30002-02 Lenovo License Agreement 05.2022 (see License.md located in the root directory) 
+# Author: Lenovo 
+#=============================================
+---
+  -  hosts: localhost
+     vars_prompt:
+      - name: "cluster_ip"
+        prompt: "Enter Cluster management IP address"
+        private: no
+      - name: "username"
+        prompt: "Enter Cluster admin username"
+        private: no
+      - name: "password"
+        prompt: "Enter Cluster admin password"
+        private: yes
+     vars:
+        login: &login
+          hostname: "{{ cluster_ip }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+          https: "y"
+          validate_certs: "n"
+        ansible_python_interpreter: /usr/bin/python3
+     #vars_files:
+     # - variables.yml
+     collections:
+      - netapp.ontap
+     tasks:
+      ###################################
+      ###Get intended storage protocol###
+      ###################################
+      - name: Prompt for SAN
+        pause:
+         prompt: "Create LUN for SAN (iSCSI/FC)? (y|n)"
+        register: is_san
+      - name: Prompt for NAS
+        when: is_san.user_input|trim == "n"
+        pause:
+         prompt: "Create volume for NAS (NFS)? (y|n)"
+        register: is_nas
+      - name: Prompt for NVMe 
+        when: is_san.user_input|trim == "n" and is_nas.user_input|trim == "n"
+        pause:
+         prompt: "Create namespace for NVMe (NVMe-FC/NVMe-TCP)? (y|n)"
+        register: is_nvme
+      - name: Detected ERROR 
+        when: is_san.user_input|trim == "n" and is_nas.user_input|trim == "n" and is_nvme.user_input|trim == "n"
+        block: 
+         - name: Print error msg
+           debug:
+            msg: "[ERROR]: Intended storage protocol not received"
+         - meta: end_play
+      ########################################
+      ###Get intended storage to be created###
+      ########################################
+      - name: Prompt for iSCSI
+        when: is_san.user_input is defined and is_san.user_input|trim == "y"
+        pause:
+         prompt: "Creating LUN for iSCSI? (y|n)"
+        register: is_iscsi
+      - name: Prompt for FC
+        when: is_san.user_input is defined and is_san.user_input|trim == "y" and is_iscsi.user_input|trim == "n"
+        pause:
+         prompt: "Creating LUN for FC? (y|n)"
+        register: is_fc
+      - name: Prompt for NFS
+        when: is_nas.user_input is defined and is_nas.user_input|trim == "y"
+        pause:
+         prompt: "Creating volume for NFS? (y|n)"
+        register: is_nfs
+      - name: Prompt for NVMe-FC
+        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y"
+        pause:
+         prompt: "Creating namespace for NVMe-FC? (y|n)"
+        register: is_nvme_fc
+      - name: Prompt for NVMe-TCP
+        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y" and is_nvme_fc.user_input|trim == "n"
+        pause:
+         prompt: "Creating namespace for NVMe-TCP? (y|n)"
+        register: is_nvme_tcp
+      - name: Detected ERROR 
+        when: (is_iscsi.user_input is defined and is_iscsi.user_input|trim == "n" and is_fc.user_input is defined and is_fc.user_input|trim == "n") or (is_nfs.user_input is defined and is_nfs.user_input|trim == "n") or (is_nvme_fc.user_input is defined and is_nvme_fc.user_input|trim == "n" and is_nvme_tcp.user_input is defined and is_nvme_tcp.user_input|trim == "n")
+        block: 
+         - name: Print error msg
+           debug:
+            msg: "[ERROR]: Intended storage not received"
+         - meta: end_play
+      #############################################################
+      ###Get user input for general options for storage creation###
+      #############################################################
+      #Get vserver information
+      - name: Collect available vservers(SVMs)
+        na_ontap_command:
+         command: ['vserver', 'show', '-fields', 'vserver']
+         exclude_lines: "u'"
+         return_dict: true
+         <<: *login
+        register: vserver_output
+      - name: Print vserver(s)
+        debug:
+         msg: "{{ vserver_output.msg.stdout_lines_filter }}"
+      - name: Get vserver
+        pause:
+         prompt: "Please enter the vserver(SVM) to be used" 
+        register: vserver
+      #Get aggregate information
+      - name: Collect aggregate info
+        na_ontap_command:
+         command: ['storage', 'aggregate', 'show', '-fields', 'aggregate']
+         exclude_lines: "u'"
+         return_dict: true
+         <<: *login
+        register: aggregate_output
+      - name: Print aggregate(s) 
+        debug:
+         msg: "{{ aggregate_output.msg.stdout_lines_filter }}"
+      - name: Get aggregate
+        pause:
+         prompt: "Please enter the data aggregate to be used"
+        register: aggregate
+      #Get storage service level
+      #Just for NFS
+      #- name: Collect storage service choice
+      #  pause:
+      #   prompt: "Please select storage service level for volume (value|performance|extreme)"
+      #  register: storage_service
+      #Get Snapshot percent use
+      - name: Collect snapshot space amount
+        pause:
+         prompt: "Please enter the percent snapshot space to use for the volume or backing volume (0 for none, 5 for default)" 
+        register: percent_snapshot_space
+      ###################################################
+      ###Get user input based on storage to be created###
+      ###################################################
+      #--SAN--
+      - name: Collect information for SAN
+        when: is_san.user_input is defined and is_san.user_input|trim == "y"
+        block: 
+         - name: Prompt for LUN name
+           pause:
+            prompt: "Please enter the name for the LUN to be created"
+           register: lun_name
+         - name: Prompt for LUN size
+           pause:
+            prompt: "Please enter the size of the LUN to be created"
+           register: lun_size
+         - name: Prompt for LUN size units
+           pause:
+            prompt: "Please enter the units for the size (kb|mb|gb|tb|pb)"
+           register: lun_size_units
+         - name: Prompt for hosting volume name
+           pause:
+            prompt: "Please enter the volume for LUN to be created from (none to create volume)"
+           register: san_flex_vol
+         - name: Prompt for OS type
+           pause:
+            prompt: "Please enter the OS type that the LUN will be used by (linux|windows|vmware)"
+           register: os_type
+         - name: Collect available igroups
+           na_ontap_command:
+            command: ['igroup', 'show']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: igroup_output
+         - name: Print igroup(s)
+           debug:
+            msg: "{{ igroup_output.msg.stdout_lines_filter }}"
+         - name: Prompt for initiator group
+           pause:
+            prompt: "Please enter name of initiator group(igroup) for LUN to be mapped to (none to create igroup)"
+           register: igroup
+      #iSCSI
+      #- name: Collect information for iSCSI
+      #  when: is_iscsi.user_input is defined and is_iscsi.user_input|trim == "y"
+      #  block: 
+      #FC
+      #- name: Collect information for FC
+      #  when: is_fc.user_input is defined and is_fc.user_input|trim == "y"
+      #  block:
+      #--NAS--
+      #- name: Collect information for NAS
+      #  when: is_nas.user_input is defined and is_nas.user_input|trim == "y"
+      #  block:
+      #NFS
+      - name: Collect information for NFS
+        when: is_nfs.user_input is defined and is_nfs.user_input|trim == "y"
+        block:
+         - name: Prompt for volume name
+           pause:
+            prompt: "Please enter the name of the volume to be created"
+           register: volume_name
+         - name: Prompt for volume size
+           pause: 
+            prompt: "Please enter the size of the volume"
+           register: volume_size
+         - name: Prompt for volume size units
+           pause:
+            prompt: "Please enter the units of the size (kb|mb|gb|tb|pb)"
+           register: volume_size_units
+         - name: Collect storage service choice
+           pause:
+            prompt: "Please select storage service level for volume (value|performance|extreme)"
+           register: storage_service
+         - name: Prompt for flexgroup
+           pause:
+            prompt: "FlexGroup volume? (y|n)"
+           register: is_flexgroup_vol
+         - name: Prompt for export policy
+           pause:
+            prompt: "Please enter export policy to use (none to create export policy)"
+           register: export_policy
+         - name: Prompt for junction path
+           pause:
+            prompt: "Please enter the junction path (Enter none to use default)"
+           register: junction_path
+         - name: Prompt for snapshot policy
+           pause:
+            prompt: "Please enter snapshot policy (Enter default to use default)"
+           register: snapshot_policy
+         - name: Prompt for space guarantee
+           when: is_flexgroup_vol.user_input == "y"
+           pause:
+            prompt: "Please enter the desired space guarantee (none|file|volume)"
+           register: space_guarantee
+         - name: Prompt for infinite volume
+           when: is_flexgroup_vol.user_input == "y"
+           pause:
+            prompt: "Infinite volume? (y|n)"
+           register: infinite_volume
+      #--NVMe--
+      - name: Collect information for NVMe
+        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y"
+        block:
+         - name: Prompt for namespace name
+           pause:
+            prompt: "Please enter name of namespace"
+           register: namespace
+         - name: Prompt for namespace size
+           pause:
+            prompt: "Please enter the size of the namespace"
+           register: namespace_size
+         - name: Prompt for namespace size units
+           pause:
+            prompt: "Please enter the units for the size (kb|mb|gb|tb|pb)"
+           register: namespace_size_units
+         - name: Prompt for backing volume
+           pause:
+            prompt: "Please enter name of backing volume for namespace (none to create)"
+           register: nvme_flex_vol
+         - name: Prompt for OS type
+           pause:
+            prompt: "Please enter the OS type that the namespace will be used by (linux|windows|vmware)"
+           register: ostype
+         - name: Prompt for nvme subsystem
+           pause:
+            prompt: "Please enter NVMe subsystem to associate with namespace (none to create subsystem)"
+           register: nvme_subsystem
+         - name: Prompt for host NQN
+           pause:
+            prompt: "Please enter host NQN to associate namespace with"
+           register: host_nqn
+      #NVMe-FC
+      #- name: Collect information for NVMe-FC
+      #  when: is_nvme_fc.user_input is defined and is_nvme_fc.user_input|trim == "y"
+      #  block:
+      #NVMe-TCP
+      #- name: Collection information for NVMe-TCP
+      #  when: is_nvme_tcp.user_input is defined and is_nvme_tcp.user_input|trim == "y"
+      #  block: 
+      ##############################################
+      ###Determine if entities need to be created###
+      ##############################################
+      #SAN
+      - name: Check backing volume
+        when: is_san.user_input is defined and is_san.user_input|trim == "y" and san_flex_vol.user_input|trim == "none"
+        block:
+         - name: Set vars
+           set_fact:
+            san_flex_vol_default: "vol_{{ lun_name.user_input|trim }}"
+         - name: Get current volume(s)
+           na_ontap_command:
+            command: ['volume', 'show', '-fields', 'volume']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: volume_list
+         - name: Check volume existence
+           when: san_flex_vol_default|trim in volume_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Duplicate volume detected ({{ san_flex_vol_default }})"
+         - meta: end_play
+           when: san_flex_vol_default|trim in volume_list.msg.stdout_lines_filter|to_json
+         - name: Create volume
+           #Create backing flexvol for LUN since doesn't exist and no dupe
+           na_ontap_volume:
+            state: present
+            name: "vol_{{ lun_name.user_input|trim }}"
+            vserver: "{{ vserver.user_input|trim }}"
+            size: "{{ lun_size.user_input|trim|int + 1}}"
+            size_unit: "{{ lun_size_units.user_input|trim }}"
+            aggregate_name: "{{ aggregate.user_input|trim }}"
+            percent_snapshot_space: "{{ percent_snapshot_space.user_input|trim }}"
+            #storage_service: "{{ storage_service.user_input|trim }}"
+            <<: *login
+      #- name: Set FlexVol name (none case)
+      #  when: is_san.user_input is defined and is_san.user_input|trim == "y" and san_flex_vol.user_input|trim == "none"
+      #  #Set flexvol name from "none" to default set name
+      #  set_fact:
+      #   san_flex_vol: "{{ san_flex_vol_default }}"
+      #- name: Set FlexVol name
+      #  when: is_san.user_input is defined and is_san.user_input|trim == "y" and san_flex_vol.user_input|trim != "none"
+      #  #Set flexvol name from "none" to default set name
+      #  set_fact:
+      #   san_flex_vol: "{{ san_flex_vol.user_input|trim }}"
+      #iSCSI
+      - name: Check igroup 
+        when: is_iscsi.user_input is defined and is_iscsi.user_input|trim == "y" and igroup.user_input|trim == "none"
+        block: 
+         #Create igroup since doesn't exist
+         - name: Get igroup name
+           pause:
+            prompt: "Please enter name of initiator group to create"
+           register: igroup_input
+         - name: Get current igroup(s)
+           na_ontap_command:
+            command: ['igroup', 'show', '-fields', 'igroup']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: igroup_list
+         - name: Check igroup existence
+           when: igroup_input.user_input|trim in igroup_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Duplicate igroup detected ({{ igroup_input.user_input|trim }})"
+         - meta: end_play
+           when: igroup_input.user_input|trim in igroup_list.msg.stdout_lines_filter|to_json
+         - name: Get initator name
+           pause:
+            prompt: "Please enter IQN(s) of initiator(s) (comma separated list with no spaces)"
+           register: initiator_names
+         - name: Create igroup 
+           na_ontap_igroup:
+            state: present
+            vserver: "{{ vserver.user_input|trim }}"
+            name: "{{ igroup_input.user_input|trim }}"
+            initiator_group_type: iscsi
+            os_type: "{{ os_type.user_input|trim }}"
+            initiator_names: "{{ initiator_names.user_input|trim }}"
+            <<: *login
+      #- name: Set igroup name (none case)
+      #  when: is_iscsi.user_input is defined and is_iscsi.user_input|trim == "y" and igroup.user_input|trim == "none"
+      #  #Set igroup name from "none" to user provided input
+      #  set_fact:
+      #   igroup: "{{ igroup_input.user_input|trim }}" 
+      #- name: Set igroup name
+      #  when: is_fc.user_input is defined and is_fc.user_input|trim == "y" and igroup.user_input|trim != "none"
+      #  set_fact:
+      #   igroup: "{{ igroup.user_input|trim }}" 
+      #FC
+      - name: Check igroup 
+        when: is_fc.user_input is defined and is_fc.user_input|trim == "y" and igroup.user_input|trim == "none"
+        block: 
+         #Create igroup since doesn't exist
+         - name: Get igroup name
+           pause:
+            prompt: "Please enter name of initiator group to create"
+           register: igroup_input
+         - name: Get current igroup(s)
+           na_ontap_command:
+            command: ['igroup', 'show', '-fields', 'igroup']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: igroup_list
+         - name: Check igroup existence
+           when: igroup_input.user_input|trim in igroup_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Duplicate igroup detected ({{ igroup_input.user_input|trim }})"
+         - meta: end_play
+           when: igroup_input.user_input|trim in igroup_list.msg.stdout_lines_filter|to_json
+         - name: Get initator name
+           pause:
+            prompt: "Please enter WWPN of initiator(s) (comma separated list with no spaces)"
+           register: initiator_names
+         - name: Create igroup 
+           na_ontap_igroup:
+            state: present
+            vserver: "{{ vserver.user_input|trim }}"
+            name: "{{ igroup_input.user_input|trim }}"
+            initiator_group_type: fcp
+            os_type: "{{ os_type.user_input|trim }}"
+            initiator_names: "{{ initiator_names.user_input|trim }}"
+            <<: *login
+     # - name: Set igroup name (none case)
+     #   when: is_fc.user_input is defined and is_fc.user_input|trim == "y" and igroup.user_input|trim == "none"
+     #   #Set igroup name from "none" to user provided input
+     #   set_fact:
+     #    igroup: "{{ igroup_input.user_input|trim }}" 
+     # - name: Set igroup name
+     #   when: is_fc.user_input is defined and is_fc.user_input|trim == "y" and igroup.user_input|trim != "none"
+     #   set_fact:
+     #    igroup: "{{ igroup.user_input|trim }}" 
+      #NAS
+      #NFS
+      - name: Check export policy
+        when: is_nfs.user_input is defined and is_nfs.user_input|trim == "y" and export_policy.user_input|trim == "none"
+        block:
+         #Create export policy since doesn't exist
+         - name: Get export policy name
+           pause:
+            prompt: "Please enter name of export policy to create"
+           register: export_policy_input
+         - name: Get current export policies
+           na_ontap_command:
+            command: ['export-policy', 'show', '-fields', 'policyname']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: export_policy_list
+         - name: Check export policy
+           when: export_policy_input.user_input|trim in export_policy_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Duplicate export policy detected ({{ export_policy_input.user_input|trim }})"
+         - meta: end_play
+           when: export_policy_input.user_input|trim in export_policy_list.msg.stdout_lines_filter|to_json
+         - name: Get allowed hosts
+           pause:
+            prompt: "Please enter IP address range(s) for allowed clients (comma separated list with no spaces)"
+           register: client_match
+         - name: Create export policy
+           na_ontap_export_policy:
+            state: present
+            name: "{{ export_policy_input.user_input|trim }}"
+            vserver: "{{ vserver.user_input|trim }}"
+            <<: *login
+         - name: Add rule to export policy
+           na_ontap_export_policy_rule:
+            state: present
+            name: "{{ export_policy_input.user_input|trim }}_rule1"
+            vserver: "{{ vserver.user_input|trim }}"
+            client_match: "{{ client_match.user_input|trim }}"
+            ro_rule: sys
+            rw_rule: sys
+            protocol: nfs,nfs3 
+            super_user_security: sys 
+            anonymous_user_id: 65534
+            allow_suid: true
+            <<: *login
+      - name: Set export policy name (none case)
+        when: is_nfs.user_input is defined and is_nfs.user_input|trim == "y" and export_policy.user_input|trim == "none"
+        #Set export policy name from "none" to user provided input
+        set_fact:
+         export_policy: "{{ export_policy_input.user_input|trim }}"
+      - name: Set export policy name
+        when: is_nfs.user_input is defined and is_nfs.user_input|trim == "y" and export_policy.user_input|trim != "none"
+        set_fact:
+         export_policy: "{{ export_policy.user_input|trim }}"
+      - name: Check junction path
+        when: is_nfs.user_input is defined and is_nfs.user_input|trim == "y" and junction_path.user_input|trim == "none"
+        set_fact:
+         junction_path: "/{{ volume_name.user_input|trim }}"
+      - name: Set junction path
+        when: is_nfs.user_input is defined and is_nfs.user_input|trim == "y" and junction_path.user_input|trim != "none"
+        set_fact:
+         junction_path: "{{ junction_path.user_input|trim }}"
+      #NVMe
+      - name: Check subsystem
+        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y" and nvme_subsystem.user_input|trim == "none"
+        block:
+         #Create NVMe subsystem since doesn't exist
+         - name: Get nvme subsystem name
+           pause:
+            prompt: "Please enter name of NVMe subsystem to create"
+           register: nvme_subsystem_input
+         - name: Get current subsystems
+           na_ontap_command:
+            command: ['vserver', 'nvme', 'subsystem', 'show', '-fields', 'subsystem']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: nvme_subsystem_list
+         - name: Check nvme subsystem
+           when: nvme_subsystem_input.user_input|trim in nvme_subsystem_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Duplicate NVMe subsystem detected ({{ nvme_subsystem_input.user_input|trim }})"
+         - meta: end_play
+           when: nvme_subsystem_input.user_input|trim in nvme_subsystem_list.msg.stdout_lines_filter|to_json
+         - name: Create nvme subsystem
+           na_ontap_nvme_subsystem:
+            state: present
+            subsystem: "{{ nvme_subsystem_input.user_input|trim }}"
+            vserver: "{{ vserver.user_input|trim }}"
+            ostype: "{{ ostype.user_input|trim }}"
+            <<: *login
+      - name: Set nvme subsystem name (none case)
+        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y" and nvme_subsystem.user_input|trim == "none"
+        #Set nvme subsystem name from "none" to user provided input
+        set_fact:
+         nvme_subsystem: "{{ nvme_subsystem_input.user_input|trim }}"
+      - name: Set nvme subsystem name
+        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y" and nvme_subsystem.user_input|trim != "none"
+        set_fact:
+         nvme_subsystem: "{{ nvme_subsystem.user_input|trim }}"
+      - name: Check backing volume
+        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y" and nvme_flex_vol.user_input|trim == "none"
+        block:
+         #Create flex vol for namespace since doesn't exist
+         - name: Set vars
+           set_fact:
+            nvme_flex_vol_default: "vol_{{ namespace.user_input|trim }}"
+         - name: Get current volume(s)
+           na_ontap_command:
+            command: ['volume', 'show', '-fields', 'volume']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: volume_list
+         - name: Check volume
+           when: nvme_flex_vol_default in volume_list.msg.stdout_lines_filter|to_json
+           block:
+            - name: Print error message
+              debug:
+               msg: "[ERROR]: Duplicate volume detected ({{ nvme_flex_vol_default }})"
+            - meta: end_play
+         - name: Create backing volume for namespace for "{{ vserver.user_input|trim }}"
+           na_ontap_volume:
+            state: present
+            name: "vol_{{ namespace.user_input|trim }}"
+            size: "{{ namespace_size.user_input|trim }}"
+            size_unit: "{{ namespace_size_units.user_input|trim }}"
+            vserver: "{{ vserver.user_input|trim }}"
+            aggregate_name: "{{ aggregate.user_input|trim }}"
+            #storage_service: "{{ storage_service.user_input|trim }}"
+            percent_snapshot_space: "{{ percent_snapshot_space.user_input|trim }}"
+            <<: *login
+#      - name: Set FlexVol name (none case)
+#        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y" and nvme_flex_vol.user_input|trim == "none"
+#        #Set flexvol name from "none" to default set name
+#        set_fact:
+#         nvme_flex_vol: "{{ nvme_flex_vol_default }}"
+#      - name: Set FlexVol name
+#        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y" and nvme_flex_vol.user_input is defined
+#        set_fact:
+#         nvme_flex_vol: "{{ nvme_flex_vol.user_input|trim }}"
+      #NVMe-FC
+      #TBD
+      #NVMe-TCP
+      #TBD
+      #####################################################################
+      ###Check validity of user inputs (existence of specified entities)###
+      #####################################################################
+      #vserver
+      - name: Check valid vserver
+        block:
+         - name: Get current vserver(s)
+           na_ontap_command:
+            command: ['vserver', 'show', '-fields', 'vserver']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: vserver_list
+         - name: Check vserver
+           when: vserver.user_input|trim not in vserver_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Invalid vserver specified ({{ vserver.user_input|trim }})"
+         - meta: end_play
+           when: vserver.user_input|trim not in vserver_list.msg.stdout_lines_filter|to_json
+      #aggregate
+      - name: Check valid aggregate
+        block:
+         - name: Get current aggregate(s)
+           na_ontap_command:
+            command: ['storage', 'aggregate', 'show', '-fields', 'aggregate']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: aggregate_list
+         - name: Check aggregate
+           when: aggregate.user_input|trim not in aggregate_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Invalid aggregate specified ({{ aggregate.user_input|trim }})"
+         - meta: end_play
+           when: aggregate.user_input|trim not in aggregate_list.msg.stdout_lines_filter|to_json
+      #storage service
+      #- name: Check valid storage service selected
+      #  block:
+      #   - name: Set valid storage services
+      #     set_fact:
+      #      storage_service_list: [value, performance, extreme]
+      #   - name: Check storage service
+      #     when: storage_service.user_input|trim not in storage_service_list|to_json
+      #     debug:
+      #      msg: "ERROR: Invalid storage service specified ({{ storage_service.user_input|trim }})"
+      #   - meta: end_play
+      #     when: storage_service.user_input|trim not in storage_service_list|to_json
+      #lun unit size
+      - name: Check valid unit size selected for lun
+        when: is_san.user_input is defined and is_san.user_input|trim == "y"
+        block:
+         - name: Set valid unit sizes
+           set_fact: 
+            unit_size_list: [kb, mb, gb, tb, pb]
+         - name: Print invalid unit size
+           when: lun_size_units.user_input|trim not in unit_size_list|to_json
+           debug:
+            msg: "[ERROR]: Invalid unit size specified ({{ lun_size_units.user_input|trim }})"
+         - meta: end_play
+           when: lun_size_units.user_input|trim not in unit_size_list|to_json
+      #volume unit size
+      - name: Check valid unit size selected for volume
+        when: is_nas.user_input is defined and is_nas.user_input|trim == "y"
+        block:
+         - name: Set valid unit sizes
+           set_fact: 
+            unit_size_list: [kb, mb, gb, tb, pb]
+         - name: Print invalid unit size
+           when: volume_size_units.user_input|trim not in unit_size_list|to_json
+           debug:
+            msg: "[ERROR]: Invalid unit size specified ({{ volume_size_units.user_input|trim }})"
+         - meta: end_play
+           when: volume_size_units.user_input|trim not in unit_size_list|to_json
+      #namespace unit size
+      - name: Check valid unit size selected for namespace
+        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y"
+        block:
+         - name: Set valid unit sizes
+           set_fact: 
+            unit_size_list: [kb, mb, gb, tb, pb]
+         - name: Print invalid unit size
+           when: namespace_size_units.user_input|trim not in unit_size_list|to_json
+           debug:
+            msg: "[ERROR]: Invalid unit size specified ({{ namespace_size_units.user_input|trim }})"
+         - meta: end_play
+           when: namespace_size_units.user_input|trim not in unit_size_list|to_json
+      #percent snapshot space
+      - name: Check valid snapshot space amount selected
+        block: 
+         - name: Check snapshot space amount
+           when: percent_snapshot_space.user_input|trim|int < 0 or percent_snapshot_space.user_input|trim|int > 100
+           debug:
+            msg: "[ERROR]: Invalid snapshot space specified ({{ percent_snapshot_space.user_input|trim }})"
+         - meta: end_play
+           when: percent_snapshot_space.user_input|trim|int < 0 or percent_snapshot_space.user_input|trim|int > 100
+      #backing volume
+      - name: Check valid backing volume
+        when: is_san.user_input is defined and is_san.user_input|trim == "y" and san_flex_vol.user_input|trim != "none" or is_nvme.user_input is defined and is_nvme.user_input|trim == "y" and nvme_flex_vol.user_input|trim != "none"
+        block:
+         - name: Get current volume(s)
+           na_ontap_command:
+            command: ['volume', 'show', '-fields', 'volume']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: volume_list
+         - name: Check volume
+           when: san_flex_vol.user_input is defined and san_flex_vol.user_input|trim not in volume_list.msg.stdout_lines_filter|to_json or nvme_flex_vol.user_input is defined and nvme_flex_vol.user_input|trim not in volume_list.msg.stdout_lines_filter|to_json
+           block: 
+            - name: Print error message
+              debug:
+               msg: "[ERROR]: Invalid volume specified"
+            - meta: end_play
+      #igroup
+      - name: Check valid igroup
+        when: is_san.user_input is defined and is_san.user_input|trim == "y"
+        block:
+         - name: Get current igroup(s)
+           na_ontap_command:
+            command: ['lun', 'igroup', 'show', '-fields', 'igroup']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: igroup_list
+         - name: Check igroup
+           when: igroup.user_input|trim not in igroup_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Invalid igroup specified"
+         - meta: end_play
+           when: igroup.user_input|trim not in igroup_list.msg.stdout_lines_filter|to_json
+      #export policy
+      - name: Check valid export policy
+        when: is_nfs.user_input is defined and is_nfs.user_input|trim == "y"
+        block:
+         - name: Get current export policies
+           na_ontap_command:
+            command: ['export-policy', 'show', '-fields', 'policyname']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: export_policy_list
+         - name: Check export policy
+           when: export_policy|trim not in export_policy_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Invalid export policy specified"
+         - meta: end_play
+           when: export_policy|trim not in export_policy_list.msg.stdout_lines_filter|to_json
+      #nvme subsystem
+      - name: Check valid nvme subsystem
+        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y"
+        block:
+         - name: Get current subsystems
+           na_ontap_command:
+            command: ['vserver', 'nvme', 'subsystem', 'show', '-fields', 'subsystem']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: nvme_subsystem_list
+         - name: Check nvme subsystem
+           when: nvme_subsystem|trim not in nvme_subsystem_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Invalid NVMe subsystem specified"
+         - meta: end_play
+           when: nvme_subsystem|trim not in nvme_subsystem_list.msg.stdout_lines_filter|to_json
+      ###Check duplicate entries of user inputs prior to creation###
+      #lun 
+      - name: Check for LUN existence
+        when: is_san.user_input is defined and is_san.user_input|trim == "y"
+        block:
+         - name: Get current luns
+           na_ontap_command:
+            command: ['lun', 'show', '-fields', 'lun']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: lun_list
+         - name: Check lun
+           when: lun_name.user_input|trim in lun_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Duplicate LUN detected ({{ lun_name.user_input|trim }})"
+         - meta: end_play
+           when: lun_name.user_input|trim in lun_list.msg.stdout_lines_filter|to_json
+      #volume
+      - name: Check for volume existence
+        when: is_nfs.user_input is defined and is_nfs.user_input|trim == "y"
+        block:
+         - name: Get current volumes
+           na_ontap_command:
+            command: ['volume', 'show', '-fields', 'volume']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: volume_list
+         - name: Check volume
+           when: volume_name.user_input|trim in volume_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Duplicate volume detected ({{ volume_name.user_input|trim }})"
+         - meta: end_play
+           when: volume_name.user_input|trim in volume_list.msg.stdout_lines_filter|to_json
+      #namespace
+      - name: Check for namespace existence
+        when: is_nvme.user_input is defined and is_nvme.user_input|trim == "y"
+        block:
+         - name: Get current namespaces
+           na_ontap_command:
+            command: ['vserver', 'nvme', 'namespace', 'show', '-fields', 'path']
+            exclude_lines: "u'"
+            return_dict: true
+            <<: *login
+           register: namespace_list
+         - name: Check namespace
+           when: namespace.user_input|trim in namespace_list.msg.stdout_lines_filter|to_json
+           debug:
+            msg: "[ERROR]: Duplicate namespace detected ({{ namespace.user_input|trim }})"
+         - meta: end_play
+           when: namespace.user_input|trim in namespace_list.msg.stdout_lines_filter|to_json
+      ######################
+      ###Storage creation###
+      ######################
+      #iSCSI
+      - name: iSCSI storage creation
+        when: is_iscsi.user_input is defined and is_iscsi.user_input|trim == "y"
+        block: 
+         - name: Create LUN for {{ vserver.user_input|trim }} (default vol)
+           when: san_flex_vol.user_input|trim == "none"
+           na_ontap_lun:
+            state: present
+            name: "{{ lun_name.user_input|trim }}"
+            size: "{{ lun_size.user_input|trim }}"
+            size_unit: "{{ lun_size_units.user_input|trim }}"
+            vserver: "{{ vserver.user_input|trim }}"
+            #aggregate_name: "{{ aggregate.user_input|trim }}"
+            #storage_service: "{{ storage_service.user_input|trim }}"
+            #percent_snapshot_space: "{{ percent_snapshot_space.user_input|trim }}"
+            flexvol_name: "vol_{{ lun_name.user_input|trim }}"
+            os_type: "{{ os_type.user_input|trim }}"
+            #igroup_name: "{{ igroup }}"
+            space_reserve: "y"
+            <<: *login
+         - name: Create LUN for {{ vserver.user_input|trim }}
+           when: san_flex_vol.user_input|trim != "none"
+           na_ontap_lun:
+            state: present
+            name: "{{ lun_name.user_input|trim }}"
+            size: "{{ lun_size.user_input|trim }}"
+            size_unit: "{{ lun_size_units.user_input|trim }}"
+            vserver: "{{ vserver.user_input|trim }}"
+            #aggregate_name: "{{ aggregate.user_input|trim }}"
+            #storage_service: "{{ storage_service.user_input|trim }}"
+            #percent_snapshot_space: "{{ percent_snapshot_space.user_input|trim }}"
+            flexvol_name: "{{ san_flex_vol.user_input|trim }}"
+            os_type: "{{ os_type.user_input|trim }}"
+            #igroup_name: "{{ igroup }}"
+            space_reserve: "y"
+            <<: *login
+      #FC
+      - name: FC storage creation
+        when: is_fc.user_input is defined and is_fc.user_input|trim == "y" 
+        block: 
+         - name: Create LUN for {{ vserver.user_input|trim }} (default vol)
+           when: san_flex_vol.user_input|trim == "none"
+           na_ontap_lun:
+            state: present
+            name: "{{ lun_name.user_input|trim }}"
+            size: "{{ lun_size.user_input|trim }}"
+            size_unit: "{{ lun_size_units.user_input|trim }}"
+            vserver: "{{ vserver.user_input|trim }}"
+            #aggregate_name: "{{ aggregate.user_input|trim }}"
+            #storage_service: "{{ storage_service.user_input|trim }}"
+            #percent_snapshot_space: "{{ percent_snapshot_space.user_input|trim }}"
+            flexvol_name: "vol_{{ lun_name.user_input|trim }}"
+            os_type: "{{ os_type.user_input|trim }}"
+            #igroup_name: "{{ igroup }}"
+            space_reserve: "y"
+            <<: *login
+         - name: Create LUN for {{ vserver.user_input|trim }}
+           when: san_flex_vol.user_input|trim != "none"
+           na_ontap_lun:
+            state: present
+            name: "{{ lun_name.user_input|trim }}"
+            size: "{{ lun_size.user_input|trim }}"
+            size_unit: "{{ lun_size_units.user_input|trim }}"
+            vserver: "{{ vserver.user_input|trim }}"
+            #aggregate_name: "{{ aggregate.user_input|trim }}"
+            #storage_service: "{{ storage_service.user_input|trim }}"
+            #percent_snapshot_space: "{{ percent_snapshot_space.user_input|trim }}"
+            flexvol_name: "{{ san_flex_vol.user_input|trim }}"
+            os_type: "{{ os_type.user_input|trim }}"
+            #igroup_name: "{{ igroup }}"
+            space_reserve: "y"
+            <<: *login
+      #NFS
+      - name: NFS storage creation
+        when: is_nfs.user_input is defined and is_nfs.user_input|trim == "y" 
+        block:
+         - name: Create FlexVol for {{ vserver.user_input|trim }} 
+           when: is_flexgroup_vol.user_input|trim == "n"
+           na_ontap_volume:
+            state: present
+            name: "{{ volume_name.user_input|trim }}"
+            size: "{{ volume_size.user_input|trim }}"
+            size_unit: "{{ volume_size_units.user_input|trim }}"
+            vserver: "{{ vserver.user_input|trim }}"
+            aggregate_name: "{{ aggregate.user_input|trim }}"
+            storage_service: "{{ storage_service.user_input|trim }}"
+            percent_snapshot_space: "{{ percent_snapshot_space.user_input|trim }}"
+            export_policy: "{{ export_policy }}"
+            junction_path: "{{ junction_path }}"
+            snapshot_policy: "{{ snapshot_policy.user_input|trim }}"
+            <<: *login
+         - name: Create FlexGroup FlexVol for {{ vserver.user_input|trim }} 
+           when: is_flexgroup_vol.user_input|trim == "y"
+           na_ontap_volume:
+            state: present
+            name: "{{ volume_name.user_input|trim }}"
+            size: "{{ volume_size.user_input|trim }}"
+            size_unit: "{{ volume_size_units.user_input|trim }}"
+            vserver: "{{ vserver.user_input|trim }}"
+            aggr_list: "{{ aggregate.user_input|trim }}"
+            storage_service: "{{ storage_service.user_input|trim }}"
+            percent_snapshot_space: "{{ percent_snapshot_space.user_input|trim }}"
+            export_policy: "{{ export_policy }}"
+            junction_path: "{{ junction_path }}"
+            snapshot_policy: "{{ snapshot_policy.user_input|trim }}"
+            aggr_list_multiplier: 1
+            space_guarantee: "{{ space_guarantee.user_input|trim }}"
+            is_infinite:  "{{ infinite_volume.user_input|trim }}"
+            auto_provision_as: flexgroup
+            unix_permissions: 777
+            time_out: 180
+            <<: *login
+      #NVMe-FC
+      - name: NVMe-FC storage creation
+        when: is_nvme_fc.user_input is defined and is_nvme_fc.user_input|trim == "y"
+        block:
+         - name: Create namespace for {{ vserver.user_input|trim }} (default vol)
+           when: nvme_flex_vol.user_input|trim == "none"
+           na_ontap_nvme_namespace:
+            state: present
+            name: "{{ namespace.user_input|trim }}"
+            size: "{{ namespace_size.user_input|trim }}"
+            size_unit: "{{ namespace_size_units.user_input|trim }}"
+            path: "/vol/vol_{{ namespace.user_input|trim }}/{{ namespace.user_input|trim }}"
+            ostype: "{{ ostype.user_input|trim }}"
+            <<: *login
+         - name: Create namespace for {{ vserver.user_input|trim }}
+           when: nvme_flex_vol.user_input|trim != "none"
+           na_ontap_nvme_namespace:
+            state: present
+            name: "{{ namespace.user_input|trim }}"
+            size: "{{ namespace_size.user_input|trim }}"
+            size_unit: "{{ namespace_size_units.user_input|trim }}"
+            path: "/vol/{{ nvme_flex_vol.user_input|trim }}/{{ namespace.user_input|trim }}"
+            ostype: "{{ ostype.user_input|trim }}"
+            <<: *login
+         - name: Map namespace to subsystem and host (default vol)
+           when: nvme_flex_vol.user_input|trim == "none"
+           na_ontap_nvme_subsystem:
+            state: present
+            subsystem: "{{ nvme_subsystem }}" 
+            ostype: "{{ ostype.user_input|trim }}"
+            hosts: "{{ host_nqn.user_input|trim }}"
+            paths: "/vol/vol_{{ namespace.user_input|trim }}/{{ namespace.user_input|trim }}"
+            <<: *login
+         - name: Map namespace to subsystem and host
+           when: nvme_flex_vol.user_input|trim != "none"
+           na_ontap_nvme_subsystem:
+            state: present
+            subsystem: "{{ nvme_subsystem }}"
+            ostype: "{{ ostype.user_input|trim }}"
+            hosts: "{{ host_nqn.user_input|trim }}"
+            paths: "/vol/{{ nvme_flex_vol.user_input|trim }}/{{ namespace.user_input|trim }}"
+            <<: *login
+      #NVMe-TCP
+      - name: NVMe-TCP storage creation
+        when: is_nvme_tcp.user_input is defined and is_nvme_tcp.user_input|trim == "y"
+        block:
+         - name: Create namespace for {{ vserver.user_input|trim }} (default vol)
+           when: nvme_flex_vol.user_input|trim == "none"
+           na_ontap_nvme_namespace:
+            state: present
+            name: "{{ namespace.user_input|trim }}"
+            size: "{{ namespace_size.user_input|trim }}"
+            size_unit: "{{ namespace_size_units.user_input|trim }}"
+            path: "/vol/vol_{{ namespace.user_input|trim }}/{{ namespace.user_input|trim }}"
+            ostype: "{{ ostype.user_input|trim }}"
+            <<: *login
+         - name: Create namespace for {{ vserver.user_input|trim }}
+           when: nvme_flex_vol.user_input|trim != "none"
+           na_ontap_nvme_namespace:
+            state: present
+            name: "{{ namespace.user_input|trim }}"
+            size: "{{ namespace_size.user_input|trim }}"
+            size_unit: "{{ namespace_size_units.user_input|trim }}"
+            path: "/vol/{{ nvme_flex_vol.user_input|trim }}/{{ namespace.user_input|trim }}"
+            ostype: "{{ ostype.user_input|trim }}"
+            <<: *login
+         - name: Map namespace to subsystem and host (default vol)
+           when: nvme_flex_vol.user_input|trim == "none"
+           na_ontap_nvme_subsystem:
+            state: present
+            subsystem: "{{ nvme_subsystem }}"
+            ostype: "{{ ostype.user_input|trim }}"
+            hosts: "{{ host_nqn.user_input|trim }}"
+            paths: "/vol/vol_{{ namespace.user_input|trim }}/{{ namespace.user_input|trim }}"
+            <<: *login
+         - name: Map namespace to subsystem and host
+           when: nvme_flex_vol.user_input|trim != "none"
+           na_ontap_nvme_subsystem:
+            state: present
+            subsystem: "{{ nvme_subsystem }}"
+            ostype: "{{ ostype.user_input|trim }}"
+            hosts: "{{ host_nqn.user_input|trim }}"
+            paths: "/vol/{{ nvme_flex_vol.user_input|trim }}/{{ namespace.user_input|trim }}"
+            <<: *login

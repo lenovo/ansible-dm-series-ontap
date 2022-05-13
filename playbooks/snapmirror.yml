@@ -1,0 +1,110 @@
+#=============================================
+#SNAPMIRROR PLAYBOOK - DM SERIES (ONTAP systems)
+#-----
+#DESCRIPTION:
+# - Helps user to setup SnapMirror relationship between two clusters
+#USE:
+# - ansible-playbook snapmirror.yml (Follow prompts for user input when prompted)
+#---------------------------------------------
+# Copyright © 2022 Lenovo. All rights reserved. 
+# License: Subject to terms of COE-30002-02 Lenovo License Agreement 05.2022 (see License.md located in the root directory) 
+# Author: Lenovo 
+#=============================================
+---
+  -  hosts: localhost
+     vars_prompt:
+      - name: "dst_cluster_ip"
+        prompt: "Enter destination Cluster management IP address"
+        when: ({{ dst_cluster_ip }} is not defined)
+        private: no
+      - name: "dst_username"
+        prompt: "Enter destination Cluster admin username"
+        private: no
+      - name: "dst_password"
+        prompt: "Enter destination Cluster admin password"
+        private: yes
+      - name: "dst_vserver"
+        prompt: "Please enter name for destination Storage VM (SVM)"
+        private: no
+      - name: "dst_volume"
+        prompt: "Please enter destination volumne name"
+        private: no
+      # Source endpoint
+      - name: "is_remote"
+        prompt: "Is source and destination on different cluster (yes|no)"
+        private: no
+      - name: "src_vserver"
+        prompt: "Please enter name for source Storage VM (SVM)"
+        private: no
+      - name: "src_volume"
+        prompt: "Please enter source volumne"
+        private: no
+      - name: "src_cluster"
+        prompt: "Enter source Cluster name (the source endpoint of intracluster))"
+        private: no
+      - name: "src_cluster_ip"
+        prompt: "Enter source Cluster management IP address"
+        private: no
+     vars:
+        # login info on destination
+        login: &login
+          hostname: "{{ dst_cluster_ip }}"
+          username: "{{ dst_username }}"
+          password: "{{ dst_password }}"
+          https: true
+          validate_certs: false
+        ansible_python_interpreter: /usr/bin/python3
+     #vars_files:
+     # - environment.yml
+     collections:
+      - netapp.ontap
+     tasks:
+      #SnapMirror Peering
+      - name: Create SVM SnapMirror local peering
+        when:  (is_remote|lower) != "yes"
+        na_ontap_vserver_peer:
+          state: present
+          peer_vserver: "{{ src_vserver }}"
+          vserver: "{{ dst_vserver }}"
+          applications: ['snapmirror']
+          <<: *login
+      - name: Create SVM SnapMirror peering with peer cluster
+        when:  (is_remote|lower) == "yes"
+        na_ontap_vserver_peer:
+          state: present
+          peer_vserver: "{{ src_vserver }}"
+          peer_cluster: "{{ src_cluster }}"
+          # Specifies local name of the source SVM in the relationship
+          local_name_for_peer: "{{ src_vserver }}"  
+          # Specifies local name of the peer SVM in the relationship
+          local_name_for_source: "{{ src_vserver }}"  
+          vserver: "ansible_dst"
+          #peer_options:
+          #  hostname: "{{ dst_cluster_ip }}"
+          dest_hostname: "{{ dst_cluster_ip }}"
+          applications: ['snapmirror']
+          <<: *login
+      #Create SnapMirror
+      - name: Create ONTAP/ONTAP SnapMirror
+        na_ontap_snapmirror:
+          state: present
+          source_volume: "{{ src_volume }}"
+          destination_volume: "{{ dst_volume }}"
+          source_vserver: "{{ src_vserver }}"
+          destination_vserver: "{{ dst_vserver }}"
+          schedule: hourly
+          policy: MirrorAllSnapshots
+          initialize: False
+          <<: *login
+      #Initialize SnapMirror
+      - name: Inititalize ONTAP/ONTAP SnapMirror
+        na_ontap_snapmirror:
+          state: present
+          #source_path: "{{src_vserver}}:{{ src_volume }}"
+          source_endpoint:
+            path: "{{src_vserver}}:{{ src_volume }}"
+          #destination_path: "{{ dst_vserver }}:{{ dst_volume }}"
+          destination_endpoint:
+            path: "{{ dst_vserver }}:{{ dst_volume }}"
+          relationship_state: active
+          <<: *login

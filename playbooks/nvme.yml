@@ -1,0 +1,399 @@
+#=============================================
+#NVME SETUP PLAYBOOK - DM SERIES (ONTAP systems)
+#-----
+#DESCRIPTION:
+# - Helps user to create an SVM for NVMe and provision a namespace
+#   for specified initiators to use
+#USE:
+# - ansible-playbook nvme.yml (Follow prompts for user input when prompted)
+#---------------------------------------------
+# Copyright © 2022 Lenovo. All rights reserved. 
+# License: Subject to terms of COE-30002-02 Lenovo License Agreement 05.2022 (see License.md located in the root directory) 
+# Author: Lenovo 
+#=============================================
+---
+  -  hosts: localhost
+     vars_prompt:
+      - name: "cluster_ip"
+        prompt: "Enter Cluster management IP address"
+        private: no
+      - name: "username"
+        prompt: "Enter Cluster admin username"
+        private: no
+      - name: "password"
+        prompt: "Enter Cluster admin password"
+        private: yes
+      - name: "vserver"
+        prompt: "Please enter name for Storage VM (SVM) to create"
+        private: no
+      #- name: "aggregate"
+      #  prompt: "Please enter name of the data aggregate(local tier) to use or create"
+      #  private: no
+      - name: "namespace"
+        prompt: "Please enter a name for namespace to create"
+        private: no
+      - name: "namespace_size"
+        prompt: "Please enter the size for the namepsace"
+        private: no
+      - name: "namespace_size_units"
+        prompt: "Please enter the unit for the namespace size (kb|mb|gb|tb|pb)"
+        private: no
+      #- name: "storage_service"
+      #  prompt: "Please enter the storage service policy to use for the volume (value|performance|extreme)"
+      #  private: no
+      - name: "percent_snapshot_space"
+        prompt: "Please enter the percent snapshot space to use for the volume (0 for none)"
+        private: no
+      #NVMe specific fields
+      #Note: Namespace name derived from volume input above
+      - name: "transport"
+        prompt: "Please enter transport type to use for NVMe Fabric (fc|tcp)"
+        private: no
+      - name: "nvme_subsystem"
+        prompt: "Please enter name of NVMe subsystem to create"
+        private: no
+      - name: "host_nqn"
+        prompt: "Please enter host NQN"
+        private: no
+      - name: "os_type"
+        prompt: "Please enter type of OS used by initiator (linux|vmware|windows)"
+        private: no
+      - name: "confirmation"
+        prompt: "~Please note this playbook will create a SVM, data aggregates, volume, namespace, etc. Continue?(y|n)"
+        private: no
+     vars:
+        login: &login
+          hostname: "{{ cluster_ip }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+          https: true
+          validate_certs: false
+        ansible_python_interpreter: /usr/bin/python3
+     #vars_files:
+      #- vars.yml
+     collections:
+      - netapp.ontap
+     tasks:
+      ###########################
+      ###Check acknowledgement###
+      ###########################
+      - name: Check termination
+        when: confirmation|trim == "n" or confirmation|trim == "no"
+        debug:
+         msg: "Terminating playbook due to user input..."
+      - meta: end_play
+        when: confirmation|trim == "n" or confirmation|trim == "no"
+      ##############################
+      ###Get remaining user input###
+      ##############################
+      - name: Prompt for IP 1 for network interface 1
+        when: transport|trim == "tcp"
+        pause:
+         prompt: "Please enter IP 1 for network interface 1"
+        register: ip1
+      - name: Prompt for netmask for network interface 1
+        when: transport|trim == "tcp"
+        pause:
+         prompt: "Please enter Subnet Mask for network interface 1"
+        register: netmask1
+      - name: Prompt for IP 2 for network interface 2
+        when: transport|trim == "tcp"
+        pause:
+         prompt: "Please enter IP 2 for network interface 2"
+        register: ip2
+      - name: Prompt for netmask for network interface 2
+        when: transport|trim == "tcp"
+        pause:
+         prompt: "Please enter Subnet Mask for network interface 2"
+        register: netmask2
+      - name: Prompt for homeport
+        when: transport|trim == "tcp" or transport|trim == "fc"
+        pause:
+         prompt: "Please enter homeport to use for network interfaces"
+        register: home_port
+      ######################
+      ###Field Validation###
+      ######################
+      #namespace unit size
+      - name: Check valid unit size selected for namespace
+        block:
+         - name: Set valid unit sizes
+           set_fact: 
+            unit_size_list: [kb, mb, gb, tb, pb]
+         - name: Print invalid unit size
+           when: namespace_size_units|trim not in unit_size_list|to_json
+           debug:
+            msg: "[ERROR]: Invalid unit size specified ({{ namespace_size_units|trim }})"
+         - meta: end_play
+           when: namespace_size_units|trim not in unit_size_list|to_json
+      #percent snapshot space
+      - name: Check valid snapshot space amount selected
+        when: percent_snapshot_space|int < 0 or percent_snapshot_space|int > 100
+        block:
+         - name: Print invalid snapshot space amount
+           debug:
+            msg: "[ERROR]: Invalid snapshot space specified ({{ percent_snapshot_space|trim }})"
+         - meta: end_play
+      #transport
+      - name: Check valid transport selected for NVMe
+        block:
+         - name: Set valid NVMe transports
+           set_fact: 
+            nvme_transport_list: [fc, tcp]
+         - name: Check NVMe transport
+           when: transport|trim not in nvme_transport_list|to_json
+           debug:
+            msg: "[ERROR]: Invalid NVMe transport specified ({{ transport|trim }})"
+         - meta: end_play
+           when: transport|trim not in nvme_transport_list|to_json
+      #os type 
+      - name: Check valid OS type selected
+        block:
+         - name: Set valid OS types
+           set_fact: 
+            os_type_list: [linux, vmware, windows]
+         - name: Check OS type
+           when: os_type not in os_type_list|to_json
+           debug:
+            msg: "[ERROR]: Invalid OS type specified ({{ os_type }})"
+         - meta: end_play
+           when: os_type not in os_type_list|to_json
+      ####################
+      ###Pre-req checks###
+      ####################
+      #ONTAP Version Validation
+      - name: Set valid ONTAP versions (FC)
+        when: transport == "fc"
+        set_fact:
+         supported_ontap_versions_fc: ["9.7","9.8","9.9.1","9.10.1"]
+      - name: Set valid ONTAP versions (TCP)
+        when: transport == "tcp"
+        set_fact:
+         supported_ontap_versions_tcp: ["9.10.1"]
+      - name: Get ONTAP version
+        na_ontap_command:
+         command: ['cluster', 'image', 'show', '-fields', 'version']
+         exclude_lines: "ersion"
+         return_dict: true
+         <<: *login
+        register: ontap_version
+      - name: Validate supported ONTAP version (FC)
+        when: transport == "fc" and
+              ontap_version.msg.stdout_lines_filter is not search(supported_ontap_versions_fc[0]) and
+              ontap_version.msg.stdout_lines_filter is not search(supported_ontap_versions_fc[1]) and
+              ontap_version.msg.stdout_lines_filter is not search(supported_ontap_versions_fc[2]) and
+              ontap_version.msg.stdout_lines_filter is not search(supported_ontap_versions_fc[3])
+        block:
+         - name: Print not supported ONTAP version
+           debug:
+            msg: "[ERROR]: Non-supported ONTAP version for NVMe-FC. Terminating..."
+         - meta: end_play
+      - name: Validate supported ONTAP version (TCP)
+        when: transport == "tcp" and
+              ontap_version.msg.stdout_lines_filter is not search(supported_ontap_versions_tcp[0])
+        block:
+         - name: Print not supported ONTAP version
+           debug:
+            msg: "[ERROR]: Non-supported ONTAP version for NVMe-TCP. Terminating..."
+         - meta: end_play
+      #License validation
+      - name: Query for NVMe license
+        na_ontap_command:
+         command: ['license', 'show', '-package', 'NVMe_oF']
+         return_dict: true
+         <<: *login
+        register: nvme_license
+      - name: Validate presence of NVMe license
+        when: nvme_license.msg.stdout_lines is search("query")
+        block:
+         - name: Print missing license msg
+           debug:
+            msg: "[ERROR]: NVMe license required for NVMe-FC/NVMe-TCP is not installed. Terminating..."
+         - meta: end_play
+      #######################
+      ###Additional Checks###
+      #######################
+      #Spare disks for data aggregate creation
+      ########################
+      ###Creation Procedure###
+      ########################
+      - name: Gather disk facts
+        na_ontap_command:
+         command: ['disk', 'show', '-fields', 'disk']
+         return_dict: true 
+         <<: *login
+        register: disk_dict
+      #- set_fact:
+      #   full_disk_count: "{{ (((disk_dict.msg.stdout_lines|length)-3)/2)|int }}"
+      - set_fact:
+         half_disk_count: "{{ (((disk_dict.msg.stdout_lines|length)-3)/2)|int }}"
+      - name: Gather node facts
+        na_ontap_command:
+         command: ['node', 'show', '-fields', 'node']
+         exclude_lines: "u'"
+         return_dict: true 
+         <<: *login
+        register: node_dict
+      - set_fact:
+         node1: "{{ node_dict.msg.stdout_lines_filter[2] }}"
+         node2: "{{ node_dict.msg.stdout_lines_filter[3] }}"
+      - set_fact:
+         volume_name: "vol_{{ namespace }}"
+         volume_size: "{{ namespace_size }}"
+         volume_size_units: "{{ namespace_size_units }}"
+      ###Data aggregate creation###
+      - name: Create data aggregate 1 for {{ vserver }}
+        na_ontap_aggregate:
+         state: present
+         service_state: online
+         name: "{{ vserver }}_aggr_1"
+         disk_count: "{{ half_disk_count }}"
+         nodes: "{{ node1 }}"
+         wait_for_online: True
+         time_out: 300
+         <<: *login
+      - name: Create data aggregate 2 for {{ vserver }}
+        na_ontap_aggregate:
+         state: present
+         service_state: online
+         name: "{{ vserver }}_aggr_2"
+         disk_count: "{{ half_disk_count }}"
+         nodes: "{{ node2 }}"
+         wait_for_online: True
+         time_out: 300
+         <<: *login
+      ###Vserver creation###
+      - name: Create SVM {{ vserver }} with NVMe enabled
+        na_ontap_svm:
+         state: present
+         name: "{{ vserver }}"
+         allowed_protocols: nvme
+         #root_volume: "{{ vserver }}_root_vol"
+         #root_volume_aggregate: "{{ vserver }}_aggr_1"
+         #root_volume_security_style: mixed
+         <<: *login
+      ###NVMe services enable###
+      - name: Enable NVMe service
+        na_ontap_nvme:
+         state: present
+         status_admin: true
+         vserver: "{{ vserver }}"
+         <<: *login
+      ###Network interface creation###
+      - name: Create network interface 1 (NVMe-FC) for {{ vserver }}
+        when: transport|trim == "fc"
+        na_ontap_interface:
+         state: present
+         interface_name: "{{ vserver }}_data_1"
+         home_port: "{{ home_port.user_input }}"
+         home_node: "{{ node1 }}"
+         role: data #<undef|cluster|data|node-mgmt|intercluster|cluster-mgmt>
+         protocols: fc-nvme
+         admin_status: up
+         vserver: "{{ vserver }}"
+         <<: *login
+      - name: Create network interface 2 (NVMe-FC) for {{ vserver }}
+        when: transport|trim == "fc"
+        na_ontap_interface:
+         state: present
+         interface_name: "{{ vserver }}_data_2"
+         home_port: "{{ home_port.user_input }}"
+         home_node: "{{ node2 }}"
+         role: data #<undef|cluster|data|node-mgmt|intercluster|cluster-mgmt>
+         protocols: fc-nvme
+         admin_status: up
+         vserver: "{{ vserver }}"
+         <<: *login
+      - name: Create network interface 1 (NVMe/TCP) for {{ vserver }}
+        when: transport|trim == "tcp"
+        na_ontap_interface:
+         state: present
+         interface_name: "{{ vserver }}_data_1"
+         home_port: "{{ home_port.user_input }}"
+         home_node: "{{ node1 }}"
+         role: data #<undef|cluster|data|node-mgmt|intercluster|cluster-mgmt>
+         protocols: nvme-tcp
+         admin_status: up
+         address: "{{ ip1.user_input }}"
+         netmask: "{{ netmask1.user_input }}"
+         vserver: "{{ vserver }}"
+         <<: *login
+      - name: Create network interface 2 (NVMe/TCP) for {{ vserver }}
+        when: transport|trim == "tcp"
+        na_ontap_interface:
+         state: present
+         interface_name: "{{ vserver }}_data_2"
+         home_port: "{{ home_port.user_input }}"
+         home_node: "{{ node2 }}"
+         role: data #<undef|cluster|data|node-mgmt|intercluster|cluster-mgmt>
+         protocols: nvme-tcp
+         admin_status: up
+         address: "{{ ip2.user_input }}"
+         netmask: "{{ netmask2.user_input }}"
+         vserver: "{{ vserver }}"
+         <<: *login
+      ###NVMe subsystem creation###
+      - name: Create NVMe subsystem
+        na_ontap_nvme_subsystem:
+         state: present
+         subsystem: "{{ nvme_subsystem }}"
+         vserver: "{{ vserver }}"
+         ostype: "{{ os_type }}" 
+         <<: *login
+      ###Volume creation###
+      - name: Create FlexVol for {{ vserver }}
+        na_ontap_volume:
+         state: present
+         name: "{{ volume_name }}"
+         size: "{{ volume_size }}"
+         size_unit: "{{ volume_size_units }}"
+         vserver: "{{ vserver }}"
+         aggregate_name: "{{ vserver }}_aggr_1"
+         #storage_service: "{{ storage_service }}"
+         percent_snapshot_space: "{{ percent_snapshot_space }}"
+         <<: *login
+      ###NVMe namespace creation###
+      - name: Create namespace
+        na_ontap_nvme_namespace:
+         state: present
+         vserver: "{{ vserver }}"
+         ostype: "{{ os_type }}"
+         path: "/vol/{{ volume_name }}/{{ namespace }}"
+         size: "{{ namespace_size }}"
+         size_unit: "{{ namespace_size_units }}"
+         <<: *login
+      ###NVMe subsystem mapping###
+      - name: Map host/namespace to subsystem
+        na_ontap_nvme_subsystem:
+         state: present
+         subsystem: "{{ nvme_subsystem }}"
+         vserver: "{{ vserver }}"
+         ostype: "{{ os_type }}"
+         hosts: "{{ host_nqn }}"
+         paths: "/vol/{{ volume_name }}/{{ namespace }}"
+         <<: *login
+      ###Print results###
+      - name: Print results (NVMe-FC)
+        when: transport|trim == "fc"
+        debug:
+         msg:
+          - "###RESULTS###"
+          - "Created the following:"
+          - " - SVM: {{ vserver }}"
+          - " - Data aggregates(tiers): {{ vserver }}_aggr_1, {{ vserver }}_aggr_2"
+          - " - Data LIFs: {{ vserver }}_data_1, {{ vserver }}_data_2"
+          - " - NVMe Subsystem: {{ nvme_subsystem }}"
+          - " - Backing Volume: {{ volume_name }}"
+          - " - Namespace: {{ namespace }}"
+      - name: Print results (NVMe-TCP)
+        when: transport|trim == "tcp"
+        debug:
+         msg:
+          - "###RESULTS###"
+          - "Created the following:"
+          - " - SVM: {{ vserver }}"
+          - " - Data aggregates(tiers): {{ vserver }}_aggr_1, {{ vserver }}_aggr_2"
+          - " - Data LIFs: {{ vserver }}_data_1 ({{ ip1.user_input }}), {{ vserver }}_data_2 ({{ ip2.user_input }})"
+          - " - NVMe Subsystem: {{ nvme_subsystem }}"
+          - " - Backing Volume: {{ volume_name }}"
+          - " - Namespace: {{ namespace }}"

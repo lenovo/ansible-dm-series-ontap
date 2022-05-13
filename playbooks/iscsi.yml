@@ -1,0 +1,161 @@
+#=============================================
+#iSCSI SETUP PLAYBOOK - DM SERIES (ONTAP systems)
+#-----
+#DESCRIPTION:
+# - Helps user to create an SVM for iSCSI and provision a LUN
+#   for specified initiators to use
+#USE:
+# - ansible-playbook iscsi.yml (Follow prompts for user input when prompted)
+#---------------------------------------------
+# Copyright © 2022 Lenovo. All rights reserved. 
+# License: Subject to terms of COE-30002-02 Lenovo License Agreement 05.2022 (see License.md located in the root directory) 
+# Author: Lenovo 
+#=============================================
+---
+  -  hosts: localhost
+     vars_prompt:
+      - name: "cluster_ip"
+        prompt: "Enter Cluster management IP address"
+        private: no
+      - name: "username"
+        prompt: "Enter Cluster admin username"
+        private: no
+      - name: "password"
+        prompt: "Enter Cluster admin password"
+        private: yes
+      - name: "vserver"
+        prompt: "Please enter name for Storage VM (SVM) to create"
+        private: no
+      - name: "lun_count"
+        prompt: "Please enter a number of volume to create"
+        private: no
+      - name: "volume_name"
+        prompt: "Please enter a name for volume to create"
+        private: no
+      - name: "volume_size"
+        prompt: "Please enter the size for the volume (number)"
+        private: no
+      - name: "volume_size_units"
+        prompt: "Please enter the unit for the volume size (kb|mb|gb|tb|pb)"
+        private: no
+      - name: "storage_service"
+        prompt: "Please enter the storage service policy to use for the volume (value|performance|extreme)"
+        private: no
+      - name: "home_port"
+        prompt: "Please enter physical port for iSCSI LIF"
+        private: no
+      - name: "ip1"
+        prompt: "Please enter IP1 of iSCSI LIF"
+        private: no
+      - name: "ip2"
+        prompt: "Please enter IP2 of iSCSI LIF"
+        private: no
+      - name: "netmask"
+        prompt: "Please enter netmask of iSCSI LIFs"
+        private: no
+      - name: "host_iqns"
+        prompt: "Please enter host IQN(use , for multiple hosts)"
+        private: no
+      - name: "os_type"
+        prompt: "Please enter type of OS used by initiator"
+        private: no
+     vars:
+        login: &login
+          hostname: "{{ cluster_ip }}"
+          username: "{{ username }}"
+          password: "{{ password }}"
+          https: true
+          validate_certs: false
+        ansible_python_interpreter: /usr/bin/python3
+     #vars_files:
+      #- vars.yml
+     collections:
+      - netapp.ontap
+     tasks:
+      #Vserver creation
+      - name: Collect Node info
+        na_ontap_info:
+          gather_subset: cluster_node_info
+          summary: true
+          continue_on_error:
+            - missing_vserver_api_error
+            - rpc_error
+          <<: *login
+        register: info
+
+      - set_fact:
+          node1: "{{ info.ontap_info.cluster_node_info[0] }}"
+          node2: "{{ info.ontap_info.cluster_node_info[1] }}"
+      - name: Enable SVM {{ vserver }} with iSCSI
+        na_ontap_svm:
+          state: present
+          name: "{{ vserver }}"
+          allowed_protocols: ["iscsi"]
+          <<: *login
+      #Network interface creation
+      - name: Create network interface 1 (iSCSI) for {{ vserver }}
+        na_ontap_interface:
+          state: present
+          interface_name: "{{ vserver }}_iscsi_1"
+          home_port: "{{ home_port }}"
+          home_node: "{{ node1 }}"
+          role: data #<undef|cluster|data|node-mgmt|intercluster|cluster-mgmt>
+          protocols: iscsi
+          admin_status: up
+          address: "{{ ip1 }}"
+          netmask: "{{ netmask }}"
+          vserver: "{{ vserver }}"
+          <<: *login
+      - name: Create network interface 2 (iSCSI) for {{ vserver }}
+        na_ontap_interface:
+          state: present
+          interface_name: "{{ vserver }}_iscsi_2"
+          home_port: "{{ home_port }}"
+          home_node: "{{ node2 }}"
+          role: data #<undef|cluster|data|node-mgmt|intercluster|cluster-mgmt>
+          protocols: iscsi
+          admin_status: up
+          address: "{{ ip2 }}"
+          netmask: "{{ netmask }}"
+          vserver: "{{ vserver }}"
+          <<: *login
+      #iSCSI services enable
+      - name: Enable iSCSI service
+        na_ontap_iscsi:
+          state: present
+          vserver: "{{ vserver }}"
+          service_state: started
+          <<: *login
+      - name: Create new Igroup
+        na_ontap_igroup:
+          state: present
+          name: "igroup_{{ volume_name }}"
+          ostype: "{{ os_type }}"
+          initiator_names: "{{ host_iqns }}"
+          initiator_group_type: "iscsi"
+          vserver: "{{ vserver }}"
+          <<: *login
+      - name: Create LUNs using SAN application
+        na_ontap_lun:
+          state: present
+          name: "lun_{{ volume_name }}"
+          os_type: "{{ os_type }}"
+          #qos_policy_group: "{{ default(omit) }}"
+          #qos_adaptive_policy_group: "{{ default(omit) }}"
+          vserver: "{{ vserver }}"
+          san_application_template:
+            name: "app_{{ vserver }}_{{ volume_name }}"
+            igroup_name: "igroup_{{ volume_name }}"
+            lun_count: "{{ lun_count }}"
+            total_size: "{{ volume_size }}"
+            total_size_unit: "{{ volume_size_units | lower }}"
+            protection_type:
+              local_policy: "default"
+            storage_service: "{{ storage_service }}"
+            #tiering:
+            #  control: "{{ default(omit) }}"
+            #  policy: "{{ default(omit) }}"
+            #  object_stores: "{{ default(omit) }}"
+            scope: "application"
+            use_san_application: true
+          <<: *login
